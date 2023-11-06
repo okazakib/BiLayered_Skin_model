@@ -1,0 +1,301 @@
+---
+title: "Skin Organoid Visium Analysis"
+output: html_document
+date: Sys.date()
+Author: Nayanika Bhalla
+---
+
+-   **Tissue**: Skin organoid model
+-   **Species**: Homo Sapiens (mapped to GRCh38-2020-A)
+-   **Array**: 10x Visium
+-   **Spaceranger Pipeline Version**: spaceranger-2.0.1
+
+#Description:
+
+Recombinantly produced and functionalized spider silk is a highly potential candidate for being used as a matrix in tissue engineering approaches. Herein we investigated if the FN-4RepCT protein could be used to construct a ftSE. The dermal equivalent was constructed with a newly developed foaming method. This method enables the integration of cells into the silk solution followed by foaming without harming them, creating a foam-like 3D network evenly populated with cells. After a defined culture period, HEKs were seeded on top of these foams and cultured under air-liquid interface (ALI) conditions to induce the terminal differentiation and thereby build up the epidermal layer of the SE.
+
+We performed ST/Visium (provided by 10x Genomics, USA) to analyse the cell behaviour on the gene expression level, with a focus on skin-enriched genes.
+
+#Aim of the script:
+
+-   Create Seurat object from the Spaceranger pipeline output.
+-   Quality control.
+-   Perform harmony to integrate the samples and remove batch effects.
+-   Clustering
+-   Pathway analysis
+
+#Initialise script
+
+```{r}
+##Load libraries 
+library(Rcpp)
+library(dplyr)
+library(Seurat)
+library(semla)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(hdf5r)
+library(singlet)
+library(ggnewscale)
+library(viridis)
+library(gprofiler2)
+library(writexl)
+library(harmony)
+library(clustree)
+library(ReactomePA)
+library(clusterProfiler)
+library(magick)
+library(jsonlite)
+library(grid)
+```
+
+```{r}
+#Add custom functions
+'%!in%' <- Negate('%in%')
+```
+
+```{r}
+#Define file paths
+DIR_ROOT <- file.path("~/Desktop/skin_organoid_project")
+setwd(DIR_ROOT)
+
+DIR_WD <- getwd()
+DIR_DATA<- file.path(DIR_WD, "spaceranger")
+DIR_RES <- file.path(DIR_ROOT, "Visium_analysis", "results") #folder for storing results
+DIR_FIG <- file.path(DIR_RES, "figures")
+DIR_TABLE <- file.path(DIR_RES, "tables")
+
+```
+
+```{r}
+#Create a list of the directories containing spaceranger data
+sample_dirs_list <- list.dirs(path = file.path(DIR_DATA), recursive = F, full.names = T)
+# Create the lists of paths to all the relevant files for the infotable
+samples <- paste0(sample_dirs_list, "/outs/raw_feature_bc_matrix.h5")
+imgs <- paste0(sample_dirs_list, "/outs/spatial/tissue_hires_image.png")
+json <- paste0(sample_dirs_list, "/outs/spatial/scalefactors_json.json")
+spotfiles<- paste0(sample_dirs_list, "/outs/spatial/tissue_positions.csv")
+```
+
+#Create Seurat object
+
+```{r}
+#Creating the infotable
+infoTable <- tibble(samples, spotfiles, imgs,  json, # Add required columns
+                    sample_id = c("S1", "S2", "S3"),
+                    tissue = c("F10", "F10", "F11")) #Add additional columns that will be added as metadata
+```
+
+```{r}
+se <- ReadVisiumData(infoTable)
+```
+
+#Quality Control
+
+```{r}
+#Plot the number of UMI per spot
+MapFeaturesSummary(se, features = "nCount_Spatial", subplot_type = "histogram", pt_size = 1, colors = viridis::viridis(n=20)) 
+```
+
+```{r}
+#Plot the number of genes per spot
+MapFeaturesSummary(se, features = "nFeature_Spatial", subplot_type = "histogram", pt_size = 2)
+```
+
+```{r}
+#Load images in the seurat object
+se <-LoadImages(se)
+```
+
+#Data Processing
+
+##Dimensionality reduction
+
+```{r}
+#Normalise the dataset and perform dimensionality reduction
+se_pca <- se |>
+  NormalizeData(verbose = F) |> #raw count data needs to be normalized to correct for differences in sequencing depth and to make data from different spots and samples more comparable
+  ScaleData(verbose = F)|> #Scales and centers features in the dataset
+  FindVariableFeatures(verbose = F) |> #identify variable features (genes) across spots
+  RunPCA() #PCA is used to reduce the dimensionality of the data and to identify the principal components that capture the most variance in the data. 
+```
+
+```{r}
+#Visualize the gene loadings of the principal components, i.e., which genes have the most influence in each principal component
+PCHeatmap(object = se_pca,
+          dims=1:15,
+          cells=200)
+```
+
+##Data Integration Harmony is an algorithm designed to integrate or harmonize single-cell or spatial data from different batches or modalities. When you have multiple batches or datasets, batch effects can obscure or distort the biological variations in the samples. Harmony aims to correct these batch effects, allowing for integrated analysis.
+
+```{r}
+se_harmony <- se_pca |>
+  RunHarmony(group.by.vars="sample_id", verbose = F, project.dim = F, plot_convergence = T) 
+```
+
+##Clustering
+
+```{r}
+se_a <- se_harmony |>
+  RunUMAP(dims = 1:11, verbose = F)|> #UMAP is a method used to visualize high-dimensional data in a 2D or 3D space.
+  FindNeighbors(reduction = "harmony", verbose = F)|> #Constructs a shared nearest neighbor (SNN) graph using the harmony-reduced data. 
+  FindClusters(verbose = F, resolution = c(0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1)) #Louvain algorithm is applied to cluster spots based on the SNN graph generated before. By specifying multiple resolutions, we are increasing the granularity of the clustering, which is useful in an exploratory analysis.
+  
+```
+
+```{r}
+clustree(se_a, prefix = "Spatial_snn_res.") #Visualise the hierarchy of clusters to guide us in choosing an appropriate resolution for further analysis.
+```
+
+```{r}
+Idents(se_a) <-  "Spatial_snn_res.0.5" #Selected resolution
+```
+
+```{r}
+#Define cluster colours for visualisation
+cluster_colors <- c("#B72A2E","#E59010","#669F56","#083D77")
+```
+
+```{r}
+DimPlot(se_a, reduction = "umap")
+DimPlot(se_a, reduction = "umap", group.by = "sample_id")
+```
+
+```{r}
+MapLabels(se_a, 
+          column_name = "Spatial_snn_res.0.5", 
+          #split_labels = TRUE, 
+          image_use = "raw", 
+          ncol = 2,
+          pt_size = 1.25,
+          drop_na = TRUE, 
+          override_plot_dims = TRUE,
+          colors = cluster_colors) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right", 
+        legend.title = element_blank(), 
+        legend.margin = margin(-8, 8, -8, 8), 
+        plot.title = element_blank(), 
+        plot.margin = margin(0, 5, 5, 0)) &
+  guides(fill = guide_legend(override.aes = list(size = 3)))
+```
+
+#DE Analysis
+
+```{r}
+se_markers <- FindAllMarkers(se_a, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = F)
+```
+
+```{r}
+se_top50_markers <-se_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 50, order_by = avg_log2FC)
+```
+
+```{r}
+top10 <- se_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+top5 <- se_markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+```
+
+We identified gene markers for certain cell types based on single cell reference dataset.
+
+```{r}
+#Keratinocytes basal cell mapping (KRT5, KRT14)
+genes_keratinocytes <- c("KRT5","KRT14")
+cols_he <- viridis::viridis(11)
+#Add module score for the genes
+se_a <- AddModuleScore(se_a, features = genes_keratinocytes, name = "Keratinocytes_basal_cell")
+```
+
+```{r}
+#Fibroblasts mapping (FBLN1, COL1A2, COL3A1, FBN1)
+genes_fibroblasts <- c("FBLN1", "COL1A2","COL3A1", "FBN1")
+cols_he <- viridis::viridis(11)
+#Add module score for the genes
+se_a <- AddModuleScore(se_a, features = genes_fibroblasts, name = "fibroblasts")
+```
+
+#Pathway Analysis
+
+We ran functional enrichment analysis on top 10 marker genes from each cluster.
+
+```{r}
+#Pathway analysis of Cluster 0
+# Get gene sets
+gene_set_C0 <- top10 |> 
+  filter(cluster == "0") |> 
+  slice_head(n = 10)
+
+# Run FEA
+fea_C0 <- gost(query = gene_set_C0$gene, ordered_query = TRUE, organism = "hsapiens", sources = "GO:BP")
+fea_results_C0 <- fea_C0$result |> 
+  as_tibble()
+
+# Look at results
+fea_results_C0
+
+pC0 <- gostplot(fea_C0, interactive = F, capped = F)
+publish_gostplot(pC0, highlight_terms =c(fea_results_C0$term_id[(1:5)]))
+```
+
+```{r}
+#Pathway analysis of Cluster 1
+# Get gene sets
+gene_set_C1 <- top10 |> 
+  filter(cluster == "1") |> 
+  slice_head(n = 10)
+
+# Run FEA
+fea_C1 <- gost(query = gene_set_C1$gene, ordered_query = TRUE, organism = "hsapiens", sources = "GO:BP")
+fea_results_C1 <- fea_C1$result |> 
+  as_tibble()
+
+# Look at results
+fea_results_C1
+
+pC1 <- gostplot(fea_C1, interactive = F, capped = F)
+
+publish_gostplot(pC1, highlight_terms =c(fea_results_C1$term_id[(1:5)]))
+```
+
+```{r}
+#Pathway analysis of Cluster 2
+# Get gene sets
+gene_set_C2 <- top10 |> 
+  filter(cluster == "2") |> 
+  slice_head(n = 10)
+
+# Run FEA
+fea_C2 <- gost(query = gene_set_C2$gene, ordered_query = TRUE, organism = "hsapiens", sources = "GO:BP")
+fea_results_C2 <- fea_C2$result |> 
+  as_tibble()
+
+# Look at results
+fea_results_C2
+
+pC2 <- gostplot(fea_C2, interactive = F, capped = F)
+
+publish_gostplot(pC2, highlight_terms =c(fea_results_C2$term_id[(1:5)]))
+```
+
+```{r}
+#Pathway analysis of Cluster 3
+# Get gene sets
+gene_set_C3 <- top10 |> 
+  filter(cluster == "3") |> 
+  slice_head(n = 10)
+
+# Run FEA
+fea_C3 <- gost(query = gene_set_C3$gene, ordered_query = TRUE, organism = "hsapiens", sources = "GO:BP")
+fea_results_C3 <- fea_C3$result |> 
+  as_tibble()
+
+# Look at results
+fea_results_C3
+
+pC3 <- gostplot(fea_C3, interactive = F, capped = F)
+
+publish_gostplot(pC3, highlight_terms =c(fea_results_C3$term_id[(1:5)]))
+```
